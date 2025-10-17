@@ -68,6 +68,19 @@ def init_db() -> None:
 			)
 			"""
 		)
+		# rewards ledger for adjustments/payments
+		cur.execute(
+			"""
+			CREATE TABLE IF NOT EXISTS rewards_ledger (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT,
+				phone TEXT,
+				points INTEGER NOT NULL,
+				reason TEXT,
+				created_at TEXT NOT NULL
+			)
+			"""
+		)
 		
 		# Add new columns to existing requests table if they don't exist
 		try:
@@ -174,6 +187,33 @@ def list_submissions(request_id: int) -> List[Dict[str, Any]]:
 		cur = conn.cursor()
 		cur.execute("SELECT * FROM submissions WHERE request_id = ? ORDER BY created_at DESC", (request_id,))
 		return cur.fetchall()
+
+
+# Rewards ledger helpers
+def add_reward_entry(name: str, phone: str, points: int, reason: str = "") -> None:
+	"""Insert an adjustment/payment entry. Negative points deduct."""
+	with get_conn() as conn:
+		cur = conn.cursor()
+		cur.execute(
+			"INSERT INTO rewards_ledger (name, phone, points, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+			(name, phone, int(points), reason, datetime.utcnow().isoformat(timespec="seconds")),
+		)
+
+
+def get_rewards_adjustment_sum(name: str, phone: str) -> int:
+	"""Sum of adjustments for a person (can be negative)."""
+	with get_conn() as conn:
+		cur = conn.cursor()
+		cur.execute("SELECT COALESCE(SUM(points), 0) AS total FROM rewards_ledger WHERE name = ? AND phone = ?", (name, phone))
+		row = cur.fetchone()
+		return int(row["total"]) if row and row.get("total") is not None else 0
+
+
+def clear_reward_entries(name: str, phone: str) -> None:
+	"""Delete all ledger entries for a person."""
+	with get_conn() as conn:
+		cur = conn.cursor()
+		cur.execute("DELETE FROM rewards_ledger WHERE name = ? AND phone = ?", (name, phone))
 
 
 def is_token_used(token: str) -> bool:

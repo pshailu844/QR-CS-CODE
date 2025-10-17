@@ -1,13 +1,19 @@
 import os
+import base64
 import re
 import uuid
 
 import streamlit as st
+from datetime import datetime, date
+import streamlit.components.v1 as components
 
 from db import (
 	add_submission,
 	create_request,
 	delete_request,
+	add_reward_entry,
+	get_rewards_adjustment_sum,
+	clear_reward_entries,
 	wipe_database,
 	get_request_by_token,
 	get_setting,
@@ -77,8 +83,8 @@ def _admin_section() -> None:
 	st.markdown("**Quick Setup for Local Testing:**")
 	col1, col2 = st.columns(2)
 	with col1:
-		if st.button("Use Current LAN IP (192.168.1.12:8501)"):
-			set_setting("base_url", "http://192.168.1.12:8501")
+		if st.button("Use Current LAN IP (192.168.1.4:8501)"):
+			set_setting("base_url", "http://192.168.1.4:8501")
 			st.success("Set to LAN IP - QR codes will work on your local network!")
 			st.rerun()
 	with col2:
@@ -90,7 +96,7 @@ def _admin_section() -> None:
 	new_base = st.text_input(
 		"External Base URL (used in QR)",
 		value=current_base,
-		placeholder="http://192.168.1.12:8501 or https://your-domain.com",
+		placeholder="http://192.168.1.4:8501 or https://your-domain.com",
 		help="Full URL where this app is reachable from mobile devices scanning the QR.",
 	)
 	if st.button("Save Settings"):
@@ -141,8 +147,22 @@ def _admin_section() -> None:
 		st.markdown("**Usage Settings**")
 		one_time_use = st.checkbox("One-time Use", value=True, help="QR code expires after one submission")
 		
-		# QR Customization
-		st.markdown("**QR Code Options**")
+		# Batch Options (merged into create form)
+		st.markdown("**Batch QR Options**")
+		col_b1, col_b2 = st.columns(2)
+		with col_b1:
+			num_qr = st.number_input("Number of QR codes", min_value=1, max_value=100, value=1, help="Generate multiple QR codes in one go")
+		with col_b2:
+			size_label = st.selectbox("QR Size", ["45x35mm (Passport)", "35x25mm (Small)", "55x45mm (Large)"], index=0)
+		size_map = {
+			"45x35mm (Passport)": (45, 35),
+			"35x25mm (Small)": (35, 25),
+			"55x45mm (Large)": (55, 45),
+		}
+		selected_size = size_map[size_label]
+		
+		# QR Content
+		st.markdown("**QR Code Content**")
 		qr_type = st.radio("QR Code Content", ["Auto URL", "Custom Text"], index=0)
 		custom_qr_text = ""
 		if qr_type == "Custom Text":
@@ -153,20 +173,78 @@ def _admin_section() -> None:
 		if not title.strip():
 			st.error("Title is required")
 		else:
-			token = uuid.uuid4().hex
-			req = create_request(title.strip(), description.strip(), token)
-			st.success("Request created")
-			st.session_state["last_created_id"] = req["id"]
+			created_requests = []
+			qr_images = []
+			qr_contents = []
+			base_url = get_setting("base_url", "") or "http://192.168.1.4:8501"
 			
-			# Store points for this request
-			set_setting(f"points_{req['id']}", str(points))
+			from qr_utils import image_to_bytes, generate_qr
 			
-			# Set one-time use flag
-			set_one_time_use(req["id"], one_time_use)
+			if int(num_qr) == 1:
+				# Single request
+				token = uuid.uuid4().hex
+				req = create_request(title.strip(), description.strip(), token)
+				created_requests.append(req)
+				set_setting(f"points_{req['id']}", str(points))
+				set_one_time_use(req["id"], one_time_use)
+				if qr_type == "Custom Text" and custom_qr_text.strip():
+					set_setting(f"qr_custom_{req['id']}", custom_qr_text.strip())
+				# Build QR content
+				content = custom_qr_text.strip() if qr_type == "Custom Text" and custom_qr_text.strip() else _build_form_url(base_url, token)
+				qr_contents.append(content)
+				from qr_utils import generate_passport_size_qr
+				qr_images.append(generate_passport_size_qr(content, selected_size))
+			else:
+				# Batch create multiple requests
+				for i in range(int(num_qr)):
+					btok = uuid.uuid4().hex
+					req = create_request(f"{title.strip()} #{i+1}", description.strip(), btok)
+					created_requests.append(req)
+					set_setting(f"points_{req['id']}", str(points))
+					set_one_time_use(req["id"], one_time_use)
+					# Content per QR
+					content = custom_qr_text.strip() if qr_type == "Custom Text" and custom_qr_text.strip() else _build_form_url(base_url, btok)
+					qr_contents.append(content)
+					from qr_utils import generate_passport_size_qr
+					qr_images.append(generate_passport_size_qr(content, selected_size))
 			
-			if qr_type == "Custom Text" and custom_qr_text.strip():
-				# Store custom QR text in settings for this request
-				set_setting(f"qr_custom_{req['id']}", custom_qr_text.strip())
+			st.success(f"Created {len(created_requests)} request(s)")
+			# If generated multiple or one, render an A4 layout for printing
+			from qr_utils import create_a4_print_layout
+			a4_layout = create_a4_print_layout(qr_images, selected_size)
+			layout_bytes = image_to_bytes(a4_layout, "PNG")
+			st.markdown("**Preview (A4 Layout):**")
+			st.image(layout_bytes, caption=f"A4 Print Layout - {len(qr_images)} QR codes", use_container_width=True)
+			col_dl1, col_dl2 = st.columns(2)
+			with col_dl1:
+				st.download_button(
+					label="📥 Download A4 Print Layout (PNG)",
+					data=layout_bytes,
+					file_name=f"{title.strip().replace(' ','_')}_qr_{len(qr_images)}.png",
+					mime="image/png",
+				)
+			with col_dl2:
+				try:
+					from reportlab.pdfgen import canvas
+					from reportlab.lib.pagesizes import A4
+					from reportlab.lib.utils import ImageReader
+					import io
+					pdf_buf = io.BytesIO()
+					c = canvas.Canvas(pdf_buf, pagesize=A4)
+					img_buf = io.BytesIO(layout_bytes)
+					img_reader = ImageReader(img_buf)
+					c.drawImage(img_reader, 0, 0, width=A4[0], height=A4[1])
+					c.save()
+					st.download_button("📄 Download A4 Print (PDF)", data=pdf_buf.getvalue(), file_name=f"{title.strip().replace(' ','_')}_qr_{len(qr_images)}.pdf", mime="application/pdf")
+				except Exception:
+					st.info("Install 'reportlab' to enable PDF downloads: pip install reportlab")
+			
+			# Print button
+			st.markdown("""
+			<div style="text-align:center; margin: 16px 0;">
+				<button onclick="window.print()" style="background:#4CAF50;color:white;border:none;padding:12px 24px;border-radius:4px;cursor:pointer;">🖨️ Print A4 Page</button>
+			</div>
+			""", unsafe_allow_html=True)
 
 	st.divider()
 
@@ -186,7 +264,7 @@ def _admin_section() -> None:
 		with col1:
 			qr_count = st.number_input("Number of QR codes", min_value=1, max_value=100, value=10, help="How many QR codes to generate")
 		with col2:
-			qr_size_mm = st.selectbox("QR Size", ["45x35mm (Passport)", "35x25mm (Small)", "55x45mm (Large)"], index=0)
+			qr_size_mm = st.selectbox("QR Size", ["45x35mm (Passport)", "35x25mm (Small)","55x45mm (Large)"], index=0)
 		
 		# Parse size
 		size_map = {
@@ -372,7 +450,7 @@ def _admin_section() -> None:
 				st.code(f"mode=Auto URL\ntoken={token}\nurl={form_url}")
 			else:
 				# Generate QR with local IP URL
-				local_url = f"http://192.168.1.12:8501?view=form&token={token}"
+				local_url = f"http://192.168.1.4:8501?view=form&token={token}"
 				try:
 					img = generate_qr(local_url)
 					from qr_utils import image_to_bytes
@@ -454,10 +532,8 @@ def _public_form(token: str) -> None:
 	if req.get("description"):
 		st.caption(req["description"])
 	
-	# Show points information
+	# Points are tracked internally but not shown on the public form
 	points = get_setting(f"points_{req['id']}", "0")
-	if points and int(points) > 0:
-		st.success(f"🎯 Earn {points} points for completing this form!")
 
 	with st.form("submission_form"):
 		st.markdown("**Please fill in your details:**")
@@ -466,15 +542,6 @@ def _public_form(token: str) -> None:
 		phone = st.text_input("Mobile Number *", placeholder="Enter your phone number (e.g., +1234567890)", help="Enter a valid phone number")
 		email = st.text_input("Email Address (Optional)", placeholder="Enter your email address", help="Optional - enter a valid email if you have one")
 		
-		# Add form validation rules
-		st.markdown("""
-		<div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 10px 0;">
-			<strong>📋 Form Requirements:</strong><br>
-			• <strong>Name:</strong> Required - Enter your full name<br>
-			• <strong>Phone:</strong> Required - Valid phone number (7-20 digits)<br>
-			• <strong>Email:</strong> Optional - Valid email format if provided
-		</div>
-		""", unsafe_allow_html=True)
 		
 		submit = st.form_submit_button("📤 Submit Form", type="primary", use_container_width=True)
 
@@ -527,17 +594,10 @@ def _public_form(token: str) -> None:
 			add_submission(req["id"], name.strip(), phone.strip(), email.strip())
 			mark_token_used(token)
 			
-			# Success messages
+			# Success messages (no points messaging on public form)
 			st.success("✅ **Form submitted successfully!**")
-			
-			# Celebration with points
-			if points and int(points) > 0:
-				st.success(f"🎉 **Congratulations! You earned {points} points!**")
-				st.balloons()
-				st.snow()
-			else:
-				st.success("🎉 **Thank you for your submission!**")
-				st.balloons()
+			st.success("🎉 **Thank you for your submission!**")
+			st.balloons()
 			
 			# Show expiration message
 			st.error("⚠️ **This QR code has now expired and cannot be used again.**")
@@ -573,53 +633,208 @@ def _review_page() -> None:
 		st.info("No requests found.")
 		return
 	
+	# Filters
+	st.subheader("Filters")
+	colf1, colf2 = st.columns(2)
+	with colf1:
+		name_filter = st.text_input("Filter by Name", placeholder="e.g., John")
+	with colf2:
+		phone_filter = st.text_input("Filter by Mobile", placeholder="e.g., 98765")
+	
+	use_date = st.checkbox("Filter by Date Range", value=False)
+	start_date: date = None
+	end_date: date = None
+	if use_date:
+		cold1, cold2 = st.columns(2)
+		with cold1:
+			start_date = st.date_input("Start date")
+		with cold2:
+			end_date = st.date_input("End date")
+		if start_date and end_date and start_date > end_date:
+			st.warning("Start date is after end date; date filter ignored.")
+			start_date = None
+			end_date = None
+
+	# Helper to check filters
+	def _matches_filters(s: dict, req_id: int) -> bool:
+		if name_filter and name_filter.strip().lower() not in (s["name"] or "").lower():
+			return False
+		if phone_filter and phone_filter.strip() not in (s["phone"] or ""):
+			return False
+		if use_date and (start_date or end_date):
+			created = s.get("created_at") or ""
+			match_dt: datetime = None
+			try:
+				match_dt = datetime.fromisoformat(created)
+			except Exception:
+				# Best effort: take first 10 chars as date
+				try:
+					match_dt = datetime.strptime(created[:10], "%Y-%m-%d")
+				except Exception:
+					match_dt = None
+			if match_dt is None:
+				return False
+			if start_date and match_dt.date() < start_date:
+				return False
+			if end_date and match_dt.date() > end_date:
+				return False
+		return True
+
+	# Collect totals and show per-request sections
 	total_submissions = 0
+	all_filtered_rows = []  # for rewards aggregation
 	for req in all_requests:
 		subs = list_submissions(req["id"])
-		total_submissions += len(subs)
-	
-	st.metric("Total Submissions", total_submissions)
-	
-	# Show submissions by request
-	for req in all_requests:
-		subs = list_submissions(req["id"])
-		if subs:
-			# Get points for this request
-			points = get_setting(f"points_{req['id']}", "0")
-			points_text = f" ({points} points each)" if points and int(points) > 0 else ""
+		if not subs:
+			continue
+		# Points for this request
+		points_str = get_setting(f"points_{req['id']}", "0")
+		try:
+			req_points = int(points_str or 0)
+		except ValueError:
+			req_points = 0
+		
+		# Apply filters
+		filtered_subs = [s for s in subs if _matches_filters(s, req["id"]) ]
+		total_submissions += len(filtered_subs)
+		if not filtered_subs:
+			continue
+		
+		points_text = f" ({req_points} points each)" if req_points > 0 else ""
+		with st.expander(f"📋 {req['title']} ({len(filtered_subs)} submissions){points_text}", expanded=False):
+			st.write(f"**Description:** {req.get('description', 'No description')}")
+			st.write(f"**Status:** {req['status']}")
+			if req_points > 0:
+				st.write(f"**Points Awarded:** {req_points} per submission")
 			
-			with st.expander(f"📋 {req['title']} ({len(subs)} submissions){points_text}", expanded=True):
-				st.write(f"**Description:** {req.get('description', 'No description')}")
-				st.write(f"**Status:** {req['status']}")
-				if points and int(points) > 0:
-					st.write(f"**Points Awarded:** {points} per submission")
-				
-				# Display submissions in a table
-				submission_data = []
-				for s in subs:
-					submission_data.append({
-						"Name": s["name"],
-						"Phone": s["phone"],
-						"Email": s["email"] or "Not provided",
-						"Submitted": s["created_at"]
-					})
-				
-				if submission_data:
-					st.table(submission_data)
-					
-					# Download button for this request
-					import pandas as pd
-					df = pd.DataFrame(submission_data)
-					csv = df.to_csv(index=False)
-					st.download_button(
-						label=f"📥 Download {req['title']} Submissions",
-						data=csv,
-						file_name=f"{req['title']}_submissions.csv",
-						mime="text/csv"
-					)
+			# Display submissions in a table
+			submission_data = []
+			for s in filtered_subs:
+				row = {
+					"Name": s["name"],
+					"Phone": s["phone"],
+					"Email": s["email"] or "Not provided",
+					"Submitted": s["created_at"],
+				}
+				submission_data.append(row)
+				all_filtered_rows.append((s["name"], s["phone"], req_points))
+			
+			if submission_data:
+				st.table(submission_data)
+				# Download button for this request
+				import pandas as pd
+				df = pd.DataFrame(submission_data)
+				csv = df.to_csv(index=False)
+				st.download_button(
+					label=f"📥 Download {req['title']} Submissions",
+					data=csv,
+					file_name=f"{req['title']}_submissions.csv",
+					mime="text/csv",
+					key=f"dl_subs_{req['id']}"
+				)
+
+	# Totals metric after filtering
+	st.metric("Total Submissions (filtered)", total_submissions)
 	
-	if total_submissions == 0:
-		st.info("No submissions yet.")
+	# Rewards aggregation table (by Name + Phone)
+	st.subheader("Rewards Summary (by Name & Mobile)")
+	if not all_filtered_rows:
+		st.info("No matching submissions for the selected filters.")
+		return
+	
+	# Aggregate
+	agg: dict = {}
+	for name_val, phone_val, pts in all_filtered_rows:
+		key = (name_val or "", phone_val or "")
+		if key not in agg:
+			agg[key] = {"Name": key[0], "Phone": key[1], "Earned Points": 0, "Adjustments": 0, "Balance": 0, "Submissions": 0}
+		agg[key]["Earned Points"] += max(0, int(pts or 0))
+		agg[key]["Submissions"] += 1
+	
+	# Pull adjustments from ledger and compute balance
+	for key, row in agg.items():
+		adj = get_rewards_adjustment_sum(row["Name"], row["Phone"])  # negative to deduct
+		row["Adjustments"] = adj
+		row["Balance"] = max(0, int(row["Earned Points"]) + int(adj))
+	
+	# Render table
+	import pandas as pd
+	agg_rows = list(agg.values())
+	# Sort by Total Points desc, then Name
+	agg_rows.sort(key=lambda r: (-r["Total Points"], r["Name"]))
+	st.table(agg_rows)
+	
+	# Download rewards summary
+	df_rewards = pd.DataFrame(agg_rows)
+	st.download_button(
+		label="📥 Download Rewards Summary (CSV)",
+		data=df_rewards.to_csv(index=False),
+		file_name="rewards_summary.csv",
+		mime="text/csv",
+		key="dl_rewards_summary"
+	)
+
+	# Reward Actions section
+	st.subheader("Reward Actions")
+	st.caption("Apply adjustments or mark rewards as paid (zero out). Use negative points to deduct.")
+	with st.form("rewards_actions_form"):
+		colu1, colu2 = st.columns(2)
+		with colu1:
+			act_name = st.text_input("Name", placeholder="Exact name")
+		with colu2:
+			act_phone = st.text_input("Mobile", placeholder="Exact mobile number")
+		colv1, colv2 = st.columns(2)
+		with colv1:
+			adj_points = st.number_input("Adjustment points (negative to deduct)", value=0, step=1)
+		with colv2:
+			reason = st.text_input("Reason", placeholder="e.g., redeemed, correction", value="")
+		colb1, colb2, colb3 = st.columns(3)
+		with colb1:
+			btn_add_adj = st.form_submit_button("Add Adjustment")
+		with colb2:
+			btn_pay_all = st.form_submit_button("Pay (Zero Out)")
+		with colb3:
+			btn_delete = st.form_submit_button("Delete All Adjustments")
+
+	if btn_add_adj:
+		if not act_name.strip() or not act_phone.strip():
+			st.error("Enter Name and Mobile to apply an adjustment.")
+		else:
+			try:
+				add_reward_entry(act_name.strip(), act_phone.strip(), int(adj_points), reason.strip())
+				st.success("Adjustment added.")
+			except Exception as e:
+				st.error(f"Failed to add adjustment: {e}")
+	if btn_pay_all:
+		if not act_name.strip() or not act_phone.strip():
+			st.error("Enter Name and Mobile to pay.")
+		else:
+			# Zero out: add negative of current balance via adjustment
+			try:
+				current_adj = get_rewards_adjustment_sum(act_name.strip(), act_phone.strip())
+				# recompute earned from current filtered agg if present
+				earned = 0
+				for row in agg_rows:
+					if row["Name"] == act_name.strip() and row["Phone"] == act_phone.strip():
+						earned = int(row.get("Earned Points", 0))
+						break
+				balance = max(0, earned + current_adj)
+				if balance == 0:
+					st.info("Balance already zero.")
+				else:
+					add_reward_entry(act_name.strip(), act_phone.strip(), -balance, "paid")
+					st.success("Marked as paid and zeroed balance.")
+			except Exception as e:
+				st.error(f"Failed to pay: {e}")
+	if btn_delete:
+		if not act_name.strip() or not act_phone.strip():
+			st.error("Enter Name and Mobile to delete adjustments.")
+		else:
+			try:
+				clear_reward_entries(act_name.strip(), act_phone.strip())
+				st.success("Deleted all adjustments for this person.")
+			except Exception as e:
+				st.error(f"Failed to delete adjustments: {e}")
 
 
 def main() -> None:
